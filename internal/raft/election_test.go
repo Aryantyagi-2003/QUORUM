@@ -38,23 +38,46 @@ func waitForCondition(t *testing.T, budget time.Duration, cond func() bool) bool
 	}
 }
 
+// advanceUntilSettled advances clock in a sequence of steps, up to
+// virtualBudget of total virtual time, and after EACH step pauses
+// (waitForCondition, not a further clock advance) for up to
+// settleBudget of real time to let that step's async, goroutine-driven
+// reactions finish before advancing again.
+//
+// This two-level shape — advance once, then only poll (never advance)
+// while waiting to settle — is required, not just a style preference:
+// AdvanceAndSync deliberately does not wait for Core's reaction to a
+// fire (see its doc comment), so a loop that calls it repeatedly with
+// no pause in between can advance virtual time faster than goroutine
+// scheduling can keep up. Concretely, that lets a node's OWN election
+// timer fire a second time (a real re-timeout, correctly incrementing
+// its term again) before the first round's RequestVote replies have
+// even been tallied, cascading into spurious extra elections that have
+// nothing to do with the scenario under test. Pausing to settle after
+// every single step keeps virtual time from ever getting more than one
+// step ahead of what's actually been processed.
+func advanceUntilSettled(t *testing.T, clock *FakeClock, virtualBudget, step, settleBudget time.Duration, cond func() bool) bool {
+	t.Helper()
+	elapsed := time.Duration(0)
+	for elapsed < virtualBudget {
+		clock.AdvanceAndSync(step)
+		elapsed += step
+		if waitForCondition(t, settleBudget, cond) {
+			return true
+		}
+	}
+	return false
+}
+
 // runElectionUntilConverged advances the shared virtual clock in small
 // steps, waiting after each step for the cluster to settle, until
 // exactly one leader has emerged or the virtual-time budget is
 // exhausted.
 func runElectionUntilConverged(t *testing.T, tc *testCluster, virtualBudget, step time.Duration) bool {
 	t.Helper()
-	elapsed := time.Duration(0)
-	for elapsed < virtualBudget {
-		tc.clock.AdvanceAndSync(step)
-		elapsed += step
-		if waitForCondition(t, 200*time.Millisecond, func() bool {
-			return len(tc.leaders()) == 1
-		}) {
-			return true
-		}
-	}
-	return false
+	return advanceUntilSettled(t, tc.clock, virtualBudget, step, 200*time.Millisecond, func() bool {
+		return len(tc.leaders()) == 1
+	})
 }
 
 // assertConverged checks the standard post-election invariants: exactly
