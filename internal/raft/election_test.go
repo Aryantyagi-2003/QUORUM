@@ -1,8 +1,11 @@
 package raft
 
 import (
+	"math/rand"
 	"testing"
 	"time"
+
+	"github.com/Aryantyagi-2003/Quorum/internal/storage"
 )
 
 // waitForCondition polls cond on a real (very short) interval up to a
@@ -183,5 +186,136 @@ func TestElectionConvergence_ReElectsAfterLeaderStops(t *testing.T) {
 	newTerm := tc.cores[newLeader].State().CurrentTerm
 	if newTerm <= firstTerm {
 		t.Fatalf("new leader's term = %d, want > %d (old leader's term)", newTerm, firstTerm)
+	}
+}
+
+// TestElectionSplitVote_RecoversViaSubsequentElection forces a genuine
+// split vote — two candidates, same term, neither able to reach a
+// majority — and then confirms the cluster recovers in a later term.
+// This is a real, expected Raft scenario (paper §5.2 discusses it
+// directly), not an edge case, so it gets its own dedicated test rather
+// than being left to chance inside the seeded-random convergence tests
+// above, which could pass many times over without ever happening to
+// exercise a split.
+//
+// The split itself is constructed via FakeNetwork.Drop, not by racing
+// two candidates' RequestVote goroutines against each other and hoping
+// for a particular interleaving. If nodeA and nodeB could both reach
+// the same follower, which of them that follower votes for would be a
+// genuine, unconstrained goroutine-scheduling race — precisely the kind
+// of nondeterminism the rest of this package's design (FakeClock,
+// seeded Rand) was built to keep out of these tests. Instead, the
+// network topology guarantees each follower is reachable by only ONE
+// candidate, so there is exactly one possible outcome, not a race with
+// a likely one.
+func TestElectionSplitVote_RecoversViaSubsequentElection(t *testing.T) {
+	net := NewFakeNetwork()
+	clock := NewFakeClock(time.Unix(0, 0))
+	ids := []string{"nodeA", "nodeB", "nodeC", "nodeD"}
+	cores := make(map[string]*Core)
+
+	newNode := func(id string, minTimeout, maxTimeout time.Duration) *Core {
+		l, err := storage.OpenLog(t.TempDir())
+		if err != nil {
+			t.Fatalf("OpenLog: %v", err)
+		}
+		t.Cleanup(func() { l.Close() })
+		c := NewCore(Config{
+			ID:                 id,
+			Peers:              excludeID(ids, id),
+			Transport:          &FakeTransport{Self: id, Network: net},
+			Clock:              clock,
+			Rand:               rand.New(rand.NewSource(1)),
+			HardState:          storage.NewHardStateStore(t.TempDir()),
+			Log:                l,
+			ElectionTimeoutMin: minTimeout,
+			ElectionTimeoutMax: maxTimeout,
+			HeartbeatInterval:  10 * time.Millisecond,
+		})
+		net.Register(id, c)
+		cores[id] = c
+		go c.Run()
+		t.Cleanup(c.Stop)
+		return c
+	}
+
+	const candidateTimeout = 50 * time.Millisecond
+	const voterTimeout = 5 * time.Second // effectively "never" within this test's virtual budget
+
+	// nodeA and nodeB are the two candidates: identical fixed timeouts,
+	// so their first timeout fires at the same virtual instant, and both
+	// become candidates in the same term — the actual precondition for a
+	// split vote. nodeC and nodeD are pure voters for round 1; their
+	// timeout is set far beyond this test's budget so they never
+	// spontaneously start their own election and complicate the count.
+	newNode("nodeA", candidateTimeout, candidateTimeout)
+	newNode("nodeB", candidateTimeout, candidateTimeout)
+	newNode("nodeC", voterTimeout, voterTimeout)
+	newNode("nodeD", voterTimeout, voterTimeout)
+
+	// Round 1 topology: nodeA <-> nodeB is cut (so neither can ever vote
+	// for the other, regardless of which of them "gets there first" —
+	// eliminating that race entirely, not just making it unlikely).
+	// nodeA <-> nodeD and nodeB <-> nodeC are also cut, leaving nodeA
+	// reachable only by nodeC, and nodeB reachable only by nodeD. Each
+	// candidate ends up with exactly 2 of the 4 votes (self + its one
+	// reachable follower) — short of the 3-vote majority a 4-node
+	// cluster requires.
+	net.Drop("nodeA", "nodeB")
+	net.Drop("nodeB", "nodeA")
+	net.Drop("nodeA", "nodeD")
+	net.Drop("nodeD", "nodeA")
+	net.Drop("nodeB", "nodeC")
+	net.Drop("nodeC", "nodeB")
+
+	clock.AdvanceAndSync(candidateTimeout)
+
+	splitConfirmed := waitForCondition(t, time.Second, func() bool {
+		a, b := cores["nodeA"].State(), cores["nodeB"].State()
+		return a.Role == Candidate && b.Role == Candidate &&
+			a.CurrentTerm == 1 && b.CurrentTerm == 1
+	})
+	if !splitConfirmed {
+		t.Fatalf("round 1 did not settle into the expected split: nodeA=%+v nodeB=%+v",
+			cores["nodeA"].State(), cores["nodeB"].State())
+	}
+	for _, id := range ids {
+		if cores[id].State().Role == Leader {
+			t.Fatalf("node %s became leader off a 2-of-4 vote split — safety violation", id)
+		}
+	}
+
+	// Round 2: heal the network, but isolate nodeB entirely (rather than
+	// just reconnecting everyone and hoping nodeA wins the next race) so
+	// the recovery outcome is deterministic too. nodeA now reaches every
+	// other node and should win outright on its very next scheduled
+	// retry — the same fixed 50ms timeout it was already counting down
+	// to before the split.
+	net.HealAll()
+	net.Drop("nodeB", "nodeA")
+	net.Drop("nodeA", "nodeB")
+	net.Drop("nodeB", "nodeC")
+	net.Drop("nodeC", "nodeB")
+	net.Drop("nodeB", "nodeD")
+	net.Drop("nodeD", "nodeB")
+
+	clock.AdvanceAndSync(candidateTimeout) // nodeA and nodeB's next simultaneous retry, at virtual t=100ms
+
+	recovered := waitForCondition(t, time.Second, func() bool {
+		return cores["nodeA"].State().Role == Leader
+	})
+	if !recovered {
+		t.Fatalf("cluster did not recover after the split: nodeA=%+v nodeB=%+v nodeC=%+v nodeD=%+v",
+			cores["nodeA"].State(), cores["nodeB"].State(), cores["nodeC"].State(), cores["nodeD"].State())
+	}
+
+	final := cores["nodeA"].State()
+	if final.CurrentTerm != 2 {
+		t.Fatalf("nodeA's term = %d, want exactly 2 (round 1 was term 1; recovery is nodeA's very next retry, term 2)", final.CurrentTerm)
+	}
+	for _, id := range []string{"nodeB", "nodeC", "nodeD"} {
+		if cores[id].State().Role == Leader {
+			t.Fatalf("node %s also reports Leader — two leaders in the same cluster is a safety violation", id)
+		}
 	}
 }
