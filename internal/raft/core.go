@@ -150,6 +150,14 @@ type Core struct {
 	stopCh      chan struct{}
 	stopOnce    sync.Once
 
+	// commitNotifyCh is a buffered-1, coalescing signal fired whenever
+	// commitIndex advances, for an external Applier (Phase 4) to wake up
+	// on rather than poll. A missed/coalesced signal is harmless: the
+	// Applier always re-reads State().CommitIndex rather than trusting
+	// the signal's payload, so at most it wakes up once more than
+	// strictly necessary, never too few times.
+	commitNotifyCh chan struct{}
+
 	// electionTimer is created here, synchronously, in NewCore rather
 	// than inside Run — Run executes on its own goroutine, and a caller
 	// (e.g. a FakeClock-driven test) may advance the clock immediately
@@ -171,17 +179,18 @@ func NewCore(cfg Config) *Core {
 		panic(fmt.Sprintf("raft: failed to load hard state: %v", err))
 	}
 	c := &Core{
-		cfg:         cfg,
-		role:        Follower,
-		currentTerm: hs.CurrentTerm,
-		votedFor:    hs.VotedFor,
-		voteReqCh:   make(chan voteRequest),
-		appendReqCh: make(chan appendRequest),
-		voteResCh:   make(chan voteResult),
-		appendResCh: make(chan appendEntriesResult),
-		proposeCh:   make(chan proposeRequest),
-		stateCh:     make(chan stateQuery),
-		stopCh:      make(chan struct{}),
+		cfg:            cfg,
+		role:           Follower,
+		currentTerm:    hs.CurrentTerm,
+		votedFor:       hs.VotedFor,
+		voteReqCh:      make(chan voteRequest),
+		appendReqCh:    make(chan appendRequest),
+		voteResCh:      make(chan voteResult),
+		appendResCh:    make(chan appendEntriesResult),
+		proposeCh:      make(chan proposeRequest),
+		stateCh:        make(chan stateQuery),
+		stopCh:         make(chan struct{}),
+		commitNotifyCh: make(chan struct{}, 1),
 	}
 	c.electionTimer = cfg.Clock.NewTimer(c.randomizedElectionTimeout())
 	return c
@@ -225,7 +234,18 @@ func (c *Core) Run() {
 
 		case <-electionTimer.C():
 			c.startElection()
-			electionTimer.Reset(c.randomizedElectionTimeout()) // a failed/split election must also time out and retry
+			if c.role == Leader {
+				// Single-node cluster: startElection went straight to
+				// Leader on its own (no peers to wait on votes from,
+				// so tallyVote -- the usual place that stops this
+				// timer -- never runs). Without this, the timer would
+				// keep firing every timeout indefinitely, each time
+				// re-electing an already-current leader and doing a
+				// wasted persistHardState.
+				electionTimer.Stop()
+			} else {
+				electionTimer.Reset(c.randomizedElectionTimeout()) // a failed/split election must also time out and retry
+			}
 
 		case res := <-c.voteResCh:
 			if c.tallyVote(res) {
@@ -335,6 +355,35 @@ func (c *Core) Propose(command []byte) (index, term uint64, isLeader bool) {
 	}
 }
 
+// CommitNotifyChan returns a channel that receives a value whenever
+// commitIndex advances. It's a coalescing signal, not a queue — a
+// consumer that's still processing one notification when another fire
+// happens will simply see one wakeup instead of two; since a consumer
+// should always re-read State().CommitIndex rather than trust the
+// signal's payload, that's harmless. Intended for Phase 4's Applier.
+func (c *Core) CommitNotifyChan() <-chan struct{} {
+	return c.commitNotifyCh
+}
+
+// notifyCommitAdvanced performs the non-blocking coalescing send. Must
+// only be called from Core's own goroutine, immediately after
+// commitIndex is updated.
+func (c *Core) notifyCommitAdvanced() {
+	select {
+	case c.commitNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
+// LogEntry returns the log entry at index, for an external Applier to
+// read once it's been committed. Safe to call from any goroutine:
+// storage.Log guards its own state with an internal mutex independent
+// of Core's single-goroutine model, so concurrent reads here are safe
+// even while Core's own goroutine is the sole writer to the log.
+func (c *Core) LogEntry(index uint64) (proto.LogEntry, bool) {
+	return c.cfg.Log.Get(index)
+}
+
 // HandleRequestVote implements RPCHandler for inbound RequestVote RPCs.
 func (c *Core) HandleRequestVote(args *proto.RequestVoteArgs) *proto.RequestVoteReply {
 	reply := make(chan *proto.RequestVoteReply)
@@ -394,6 +443,7 @@ func (c *Core) startElection() {
 	c.persistHardState()
 
 	args := &proto.RequestVoteArgs{
+		RPC:          "RequestVote", // the envelope tag RPCListener's real-TCP dispatch keys on; FakeTransport bypasses it entirely, which is why this being unset never showed up in Phase 2/3's tests
 		Term:         c.currentTerm,
 		CandidateID:  c.cfg.ID,
 		LastLogIndex: c.cfg.Log.LastIndex(),
@@ -564,6 +614,7 @@ func (c *Core) handleAppendEntries(args *proto.AppendEntriesArgs) (*proto.Append
 		} else {
 			c.commitIndex = lastNew
 		}
+		c.notifyCommitAdvanced()
 	}
 
 	return &proto.AppendEntriesReply{Term: c.currentTerm, Success: true}, true
@@ -623,6 +674,7 @@ func (c *Core) replicateToAllPeers() {
 		prevTerm, _ := c.cfg.Log.TermAt(prevIndex) // (0, false) at prevIndex == 0 is the correct sentinel term
 		entries := c.cfg.Log.Slice(next)
 		args := &proto.AppendEntriesArgs{
+			RPC:          "AppendEntries", // see the matching note in startElection's RequestVoteArgs
 			Term:         c.currentTerm,
 			LeaderID:     c.cfg.ID,
 			PrevLogIndex: prevIndex,
@@ -724,6 +776,7 @@ func (c *Core) advanceCommitIndex() {
 		}
 		if count*2 > len(c.cfg.Peers)+1 {
 			c.commitIndex = n
+			c.notifyCommitAdvanced()
 			break
 		}
 	}
@@ -743,6 +796,7 @@ func (c *Core) propose(command []byte) proposeReply {
 		// A single-node cluster commits immediately -- there's no one
 		// else to wait on for a majority.
 		c.commitIndex = index
+		c.notifyCommitAdvanced()
 	}
 	c.replicateToAllPeers()
 	return proposeReply{index: index, term: c.currentTerm, isLeader: true}

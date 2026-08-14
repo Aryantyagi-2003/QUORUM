@@ -1,75 +1,63 @@
 // Package server implements Quorum's client-facing TCP listener.
 //
-// This file (server.go) is the Phase 1 single-node harness: it wires
-// client requests straight through the durable log and into the KV
-// state machine with no Raft consensus involved (term is hard-coded to
-// 1, there is exactly one "node" and it always accepts writes). Its
-// purpose is to validate the storage engine and wire protocol in
-// isolation before leader election and replication are layered in, per
-// the project's staged build plan. Once the Raft core lands, this
-// dispatch will be replaced by routing writes through the consensus
-// module instead of appending directly.
+// Phase 4: client writes go through raft.Core.Propose and are only
+// acknowledged once actually applied (via internal/applier) to the KV
+// state machine — replacing Phase 1's direct-to-log write path, which
+// had no consensus at all. Reads are served only from the leader
+// (Phase 0's documented linearizability-over-follower-read-scalability
+// tradeoff): a non-leader returns "not leader" plus a LeaderHint the
+// client can redirect to, exactly like a write would.
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"sync"
+	"time"
 
+	"github.com/Aryantyagi-2003/Quorum/internal/applier"
 	"github.com/Aryantyagi-2003/Quorum/internal/kvstore"
 	"github.com/Aryantyagi-2003/Quorum/internal/proto"
-	"github.com/Aryantyagi-2003/Quorum/internal/storage"
+	"github.com/Aryantyagi-2003/Quorum/internal/raft"
 )
 
-// singleNodeTerm is the fixed log term used before Raft leader election
-// exists. Real terms start at 0 and increase via elections; Phase 1
-// has no elections, so every entry is written as term 1.
-const singleNodeTerm = 1
+const defaultWriteTimeout = 2 * time.Second
+
+// errLostLeadership means this node stopped being leader (or moved to
+// a later term) before a proposed entry was confirmed applied. The
+// entry may or may not still commit under new leadership — leader
+// completeness (proven in Phase 3) guarantees it isn't silently lost if
+// a majority already had it — but this node can no longer promise
+// anything about it, so the client is told to redirect and retry.
+var errLostLeadership = errors.New("server: lost leadership before entry applied")
+var errApplyTimeout = errors.New("server: timed out waiting for entry to apply")
 
 type Server struct {
-	addr string
-	log  *storage.Log
-	kv   *kvstore.Store
+	addr    string
+	core    *raft.Core
+	applier *applier.Applier
+	store   *kvstore.Store
 
-	mu        sync.Mutex // serializes writes (append+apply must be atomic together)
-	nextIndex uint64
+	// clientAddrs maps a Raft node ID to that node's client-facing
+	// address, so a "not leader" response's LeaderHint is something a
+	// client can actually dial — Core only ever knows the leader's
+	// Raft node ID, not its client-facing address.
+	clientAddrs map[string]string
+
+	writeTimeout time.Duration
 }
 
-// Open opens (or creates) the on-disk log in dataDir, replays it into
-// a fresh KV store, and returns a Server ready to Listen. Replaying on
-// every startup is what makes state survive a process restart.
-func Open(addr, dataDir string) (*Server, error) {
-	l, err := storage.OpenLog(dataDir)
-	if err != nil {
-		return nil, fmt.Errorf("server: open log: %w", err)
-	}
-
-	kv := kvstore.New()
-	last := l.LastIndex()
-	for i := uint64(1); i <= last; i++ {
-		entry, ok := l.Get(i)
-		if !ok {
-			return nil, fmt.Errorf("server: replay: missing log entry at index %d", i)
-		}
-		cmd, err := kvstore.DecodeCommand(entry.Command)
-		if err != nil {
-			return nil, fmt.Errorf("server: replay: decode entry %d: %w", i, err)
-		}
-		kv.Apply(cmd)
-	}
-
+func New(addr string, core *raft.Core, ap *applier.Applier, store *kvstore.Store, clientAddrs map[string]string) *Server {
 	return &Server{
-		addr:      addr,
-		log:       l,
-		kv:        kv,
-		nextIndex: last + 1,
-	}, nil
-}
-
-func (s *Server) Close() error {
-	return s.log.Close()
+		addr:         addr,
+		core:         core,
+		applier:      ap,
+		store:        store,
+		clientAddrs:  clientAddrs,
+		writeTimeout: defaultWriteTimeout,
+	}
 }
 
 // Listen accepts client connections until the listener is closed or
@@ -80,7 +68,7 @@ func (s *Server) Listen() error {
 	if err != nil {
 		return fmt.Errorf("server: listen: %w", err)
 	}
-	log.Printf("quorumd: listening on %s", s.addr)
+	log.Printf("quorumd: client listener on %s", s.addr)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -111,15 +99,19 @@ func (s *Server) handleConn(conn net.Conn) {
 func (s *Server) dispatch(req proto.ClientRequest) proto.ClientResponse {
 	switch req.RPC {
 	case "Get":
-		value, found := s.kv.Get(req.Key)
+		snap := s.core.State()
+		if snap.Role != raft.Leader {
+			return s.notLeaderResponse(snap)
+		}
+		value, found := s.store.Get(req.Key)
 		return proto.ClientResponse{OK: true, Value: value, Found: found}
 	case "Set":
-		return s.write(kvstore.Command{
+		return s.proposeAndWait(kvstore.Command{
 			Op: kvstore.OpSet, Key: req.Key, Value: req.Value,
 			ClientID: req.ClientID, SeqNum: req.SeqNum,
 		})
 	case "Delete":
-		return s.write(kvstore.Command{
+		return s.proposeAndWait(kvstore.Command{
 			Op: kvstore.OpDelete, Key: req.Key,
 			ClientID: req.ClientID, SeqNum: req.SeqNum,
 		})
@@ -128,23 +120,59 @@ func (s *Server) dispatch(req proto.ClientRequest) proto.ClientResponse {
 	}
 }
 
-// write appends cmd to the durable log, fsyncing before applying it to
-// the state machine or acknowledging the client — the same
-// "persist before respond" rule the full Raft core will use for
-// AppendEntries.
-func (s *Server) write(cmd kvstore.Command) proto.ClientResponse {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Server) notLeaderResponse(snap raft.Snapshot) proto.ClientResponse {
+	if snap.LeaderID == "" {
+		return proto.ClientResponse{OK: false, Error: "no leader"}
+	}
+	return proto.ClientResponse{OK: false, Error: "not leader", LeaderHint: s.clientAddrs[snap.LeaderID]}
+}
 
+// proposeAndWait appends cmd to the leader's log via Core.Propose and
+// blocks until the Applier has actually applied it (not merely
+// committed it — see waitForApplied) before acknowledging the client,
+// so a client that gets OK:true is guaranteed its own write is already
+// visible to a subsequent Get on this same node.
+func (s *Server) proposeAndWait(cmd kvstore.Command) proto.ClientResponse {
 	encoded, err := kvstore.EncodeCommand(cmd)
 	if err != nil {
 		return proto.ClientResponse{OK: false, Error: err.Error()}
 	}
-	entry := proto.LogEntry{Term: singleNodeTerm, Index: s.nextIndex, Command: encoded}
-	if err := s.log.Append([]proto.LogEntry{entry}); err != nil {
-		return proto.ClientResponse{OK: false, Error: err.Error()}
+	index, term, isLeader := s.core.Propose(encoded)
+	if !isLeader {
+		return s.notLeaderResponse(s.core.State())
 	}
-	s.nextIndex++
-	s.kv.Apply(cmd)
+	if err := s.waitForApplied(index, term); err != nil {
+		if errors.Is(err, errLostLeadership) {
+			return s.notLeaderResponse(s.core.State())
+		}
+		return proto.ClientResponse{OK: false, Error: "timeout"}
+	}
 	return proto.ClientResponse{OK: true}
+}
+
+// waitForApplied blocks until index has been applied by the Applier
+// (not just committed by Core — see the package doc), or returns an
+// error explaining why it gave up. Gating on the Applier's progress
+// rather than raw commitIndex is what gives a client read-your-writes:
+// if this only waited for commitIndex, a client's Get sent immediately
+// after a successful Set could race the Applier and miss its own
+// write.
+func (s *Server) waitForApplied(index, proposeTerm uint64) error {
+	deadline := time.Now().Add(s.writeTimeout)
+	for {
+		if s.applier.LastApplied() >= index {
+			return nil
+		}
+		snap := s.core.State()
+		if snap.Role != raft.Leader || snap.CurrentTerm != proposeTerm {
+			return errLostLeadership
+		}
+		if time.Now().After(deadline) {
+			return errApplyTimeout
+		}
+		select {
+		case <-s.core.CommitNotifyChan():
+		case <-time.After(5 * time.Millisecond): // safety-net poll in case a signal was coalesced away
+		}
+	}
 }

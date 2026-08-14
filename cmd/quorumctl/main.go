@@ -2,14 +2,19 @@
 //
 // Usage:
 //
-//	quorumctl -addr 127.0.0.1:7000 get <key>
-//	quorumctl -addr 127.0.0.1:7000 set <key> <value>
-//	quorumctl -addr 127.0.0.1:7000 delete <key>
+//	quorumctl -addrs 127.0.0.1:8000,127.0.0.1:8001,127.0.0.1:8002 get <key>
+//	quorumctl -addrs 127.0.0.1:8000,127.0.0.1:8001,127.0.0.1:8002 set <key> <value>
+//	quorumctl -addrs 127.0.0.1:8000,127.0.0.1:8001,127.0.0.1:8002 delete <key>
 //
-// Phase 1: talks to a single node directly at -addr. Once replication
-// and leader redirection exist, this will grow leader-tracking (retry
-// against the LeaderHint on a "not leader" response) instead of
-// requiring the caller to already know the leader's address.
+// Phase 4: -addrs takes every node's client-facing address. quorumctl
+// tries one, and if it isn't the leader, follows the LeaderHint it
+// returns; if a node is unreachable or reports "no leader" (mid-
+// election), it backs off briefly and tries a different node. The same
+// ClientID/SeqNum is reused across every retry within one invocation,
+// so if an earlier attempt's write actually succeeded but the
+// acknowledgment was lost (e.g. the leader crashed right after
+// committing), a retried write is a safe no-op on the server side
+// rather than being applied twice.
 package main
 
 import (
@@ -18,14 +23,16 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Aryantyagi-2003/Quorum/internal/proto"
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:7000", "node address")
-	timeout := flag.Duration("timeout", 3*time.Second, "request timeout")
+	addrsFlag := flag.String("addrs", "127.0.0.1:8000", "comma-separated client-facing addresses of cluster nodes")
+	timeout := flag.Duration("timeout", 3*time.Second, "per-request timeout")
+	totalTimeout := flag.Duration("total-timeout", 10*time.Second, "overall time budget across all retries")
 	flag.Parse()
 
 	args := flag.Args()
@@ -33,6 +40,7 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	addrs := strings.Split(*addrsFlag, ",")
 
 	req := proto.ClientRequest{
 		ClientID: fmt.Sprintf("quorumctl-%d", rand.Int63()),
@@ -66,16 +74,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	resp, err := send(*addr, *timeout, req)
+	resp, err := sendWithRetry(addrs, *timeout, *totalTimeout, req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "quorumctl: %v\n", err)
 		os.Exit(1)
 	}
 	if !resp.OK {
 		fmt.Fprintf(os.Stderr, "quorumctl: error: %s\n", resp.Error)
-		if resp.LeaderHint != "" {
-			fmt.Fprintf(os.Stderr, "quorumctl: leader hint: %s\n", resp.LeaderHint)
-		}
 		os.Exit(1)
 	}
 
@@ -89,6 +94,53 @@ func main() {
 	default:
 		fmt.Println("OK")
 	}
+}
+
+// sendWithRetry tries addrs[0] first. A "not leader" response with a
+// LeaderHint is followed immediately (no backoff — the cluster already
+// told us where to go). Anything else that isn't a clean success
+// (network error, "no leader" mid-election, or "not leader" with no
+// hint yet) triggers a short backoff and a switch to the next node in
+// addrs, on the theory that a different node might have fresher
+// information. Gives up once totalTimeout has elapsed.
+func sendWithRetry(addrs []string, timeout, totalTimeout time.Duration, req proto.ClientRequest) (proto.ClientResponse, error) {
+	deadline := time.Now().Add(totalTimeout)
+	target := addrs[0]
+	var lastErr error
+	var lastResp proto.ClientResponse
+
+	for attempt := 0; ; attempt++ {
+		resp, err := send(target, timeout, req)
+		if err == nil {
+			if resp.OK {
+				return resp, nil
+			}
+			if resp.Error == "not leader" && resp.LeaderHint != "" {
+				target = resp.LeaderHint
+				continue // redirect immediately, no backoff
+			}
+			lastResp, lastErr = resp, nil
+		} else {
+			lastErr = err
+		}
+
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return proto.ClientResponse{}, fmt.Errorf("no leader found after %d attempts: %w", attempt+1, lastErr)
+			}
+			return lastResp, nil // surface the last error response (e.g. "no leader") to the caller
+		}
+		time.Sleep(backoff(attempt))
+		target = addrs[(attempt+1)%len(addrs)]
+	}
+}
+
+func backoff(attempt int) time.Duration {
+	d := time.Duration(50*(attempt+1)) * time.Millisecond
+	if d > 500*time.Millisecond {
+		return 500 * time.Millisecond
+	}
+	return d
 }
 
 func send(addr string, timeout time.Duration, req proto.ClientRequest) (proto.ClientResponse, error) {
@@ -111,7 +163,7 @@ func send(addr string, timeout time.Duration, req proto.ClientRequest) (proto.Cl
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  quorumctl [-addr host:port] [-timeout d] get <key>
-  quorumctl [-addr host:port] [-timeout d] set <key> <value>
-  quorumctl [-addr host:port] [-timeout d] delete <key>`)
+  quorumctl [-addrs host:port,...] [-timeout d] [-total-timeout d] get <key>
+  quorumctl [-addrs host:port,...] [-timeout d] [-total-timeout d] set <key> <value>
+  quorumctl [-addrs host:port,...] [-timeout d] [-total-timeout d] delete <key>`)
 }
