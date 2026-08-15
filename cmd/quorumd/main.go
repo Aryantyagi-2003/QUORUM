@@ -108,6 +108,26 @@ func main() {
 	ap := applier.New(core, store)
 	go ap.Run()
 
+	// Log every Role/CurrentTerm change. Core itself stays silent about
+	// this (it's an observability concern, not a consensus one), but
+	// Phase 5's chaos harness needs real, human-readable evidence of
+	// elections happening -- "real captured logs showing the term
+	// number incrementing and the new leader's election" -- and nothing
+	// currently produces that without this.
+	go func() {
+		var lastRole raft.Role = raft.Follower
+		var lastTerm uint64
+		for {
+			time.Sleep(30 * time.Millisecond)
+			snap := core.State()
+			if snap.Role != lastRole || snap.CurrentTerm != lastTerm {
+				log.Printf("quorumd[%s]: role=%v term=%d leader=%q commitIndex=%d",
+					*id, snap.Role, snap.CurrentTerm, snap.LeaderID, snap.CommitIndex)
+				lastRole, lastTerm = snap.Role, snap.CurrentTerm
+			}
+		}
+	}()
+
 	log.Printf("quorumd: node %q up — raft on %s, client on %s, %d peer(s)", *id, *raftAddr, *clientAddr, len(peerIDs))
 	srv := server.New(*clientAddr, core, ap, store, clientAddrs)
 	if err := srv.Listen(); err != nil {
