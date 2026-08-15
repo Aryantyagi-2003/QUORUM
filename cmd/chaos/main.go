@@ -55,6 +55,10 @@ func main() {
 		cfg.NumNodes = *nodes
 		cfg.Rounds = *rounds
 		runLeaderCrash(cfg)
+	case "partition":
+		cfg := chaos.DefaultPartitionConfig(dir, *binaryPath)
+		cfg.NumNodes = *nodes
+		runPartition(cfg)
 	default:
 		usage()
 		os.Exit(2)
@@ -100,15 +104,54 @@ func runLeaderCrash(cfg chaos.LeaderCrashConfig) {
 	}
 }
 
+func runPartition(cfg chaos.PartitionConfig) {
+	fmt.Printf("=== Scenario 2: network-partition / split-brain ===\n")
+	fmt.Printf("nodes=%d minority-size=%d election=%s-%s heartbeat=%s settling-delay=%s\n\n",
+		cfg.NumNodes, cfg.MinoritySize, cfg.ElectionMin, cfg.ElectionMax, cfg.Heartbeat, cfg.SettlingDelay)
+
+	start := time.Now()
+	report, err := chaos.RunPartition(cfg)
+	if err != nil {
+		log.Fatalf("chaos: partition scenario failed: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	fmt.Printf("\n--- Results (total wall time %s) ---\n", elapsed)
+	fmt.Printf("minority: %v\n", report.Minority)
+	fmt.Printf("majority: %v\n", report.Majority)
+	fmt.Printf("minority write probes: %d/%d correctly rejected\n", report.MinorityProbesBlocked, report.MinorityProbesTotal)
+	fmt.Printf("majority writes while isolated: %d/%d acked\n", report.MajorityWritesAcked, report.MajorityWritesTotal)
+
+	safe := report.MinorityProbesBlocked == report.MinorityProbesTotal
+	if !safe {
+		fmt.Printf("\nSAFETY: FAIL -- the minority partition accepted at least one write while isolated\n")
+	} else {
+		fmt.Printf("\nSAFETY: PASS -- the minority partition never accepted a write while isolated\n")
+	}
+
+	if len(report.Violations) == 0 {
+		fmt.Printf("verification: PASS -- post-heal state matches every acknowledged write, no fabricated state\n")
+	} else {
+		fmt.Printf("verification: FAIL -- %d violation(s):\n", len(report.Violations))
+		for _, v := range report.Violations {
+			fmt.Printf("  [rule %d] %s\n", v.Rule, v.Message)
+		}
+	}
+	if !safe || len(report.Violations) != 0 {
+		os.Exit(1)
+	}
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: chaos <scenario> [flags]
 
 scenarios:
   leader-crash   start a cluster, sustained writes, repeatedly kill -9 the leader
+  partition      split into a majority/minority, prove the minority can't write, heal, verify
 
-flags (leader-crash):
+flags:
   -nodes N          cluster size (default 5)
-  -rounds N         number of kill/recover rounds (default 5)
+  -rounds N         (leader-crash only) number of kill/recover rounds (default 5)
   -base-dir dir     node data directory (default: fresh temp dir)
   -quorumd-bin path path to a built quorumd binary (default ./bin/quorumd)`)
 }
