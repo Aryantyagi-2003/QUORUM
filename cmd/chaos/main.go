@@ -33,6 +33,8 @@ func main() {
 	fs := flag.NewFlagSet(scenario, flag.ExitOnError)
 	nodes := fs.Int("nodes", 5, "cluster size")
 	rounds := fs.Int("rounds", 5, "number of kill/recover rounds")
+	writers := fs.Int("writers", 5, "(concurrent only) number of concurrent writer goroutines")
+	kills := fs.Int("kills", 3, "(concurrent only) number of leader kills to force during the run")
 	baseDir := fs.String("base-dir", "", "directory for node data (default: a fresh temp dir)")
 	binaryPath := fs.String("quorumd-bin", "./bin/quorumd", "path to a built quorumd binary")
 	fs.Parse(os.Args[2:])
@@ -59,6 +61,12 @@ func main() {
 		cfg := chaos.DefaultPartitionConfig(dir, *binaryPath)
 		cfg.NumNodes = *nodes
 		runPartition(cfg)
+	case "concurrent":
+		cfg := chaos.DefaultConcurrentConfig(dir, *binaryPath)
+		cfg.NumNodes = *nodes
+		cfg.NumWriters = *writers
+		cfg.Kills = *kills
+		runConcurrent(cfg)
 	default:
 		usage()
 		os.Exit(2)
@@ -142,16 +150,48 @@ func runPartition(cfg chaos.PartitionConfig) {
 	}
 }
 
+func runConcurrent(cfg chaos.ConcurrentConfig) {
+	fmt.Printf("=== Scenario 3: concurrent writes under failover ===\n")
+	fmt.Printf("nodes=%d writers=%d kills=%d election=%s-%s heartbeat=%s\n\n",
+		cfg.NumNodes, cfg.NumWriters, cfg.Kills, cfg.ElectionMin, cfg.ElectionMax, cfg.Heartbeat)
+
+	start := time.Now()
+	report, err := chaos.RunConcurrent(cfg)
+	if err != nil {
+		log.Fatalf("chaos: concurrent scenario failed: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	fmt.Printf("\n--- Results (total wall time %s) ---\n", elapsed)
+	for i, k := range report.Kills {
+		fmt.Printf("kill %d: killed %-4s -> new leader %-4s in %s (writers kept running)\n", i+1, k.KilledNode, k.NewLeader, k.ElectionDuration)
+	}
+	fmt.Printf("\nwrites: attempted=%d acked=%d\n", report.TotalWritesAttempted, report.TotalWritesAcked)
+
+	if len(report.Violations) == 0 {
+		fmt.Printf("verification: PASS -- every acknowledged write (including every hot-key overwrite, checked for correct final ordering) present with the correct value, no fabricated state\n")
+	} else {
+		fmt.Printf("verification: FAIL -- %d violation(s):\n", len(report.Violations))
+		for _, v := range report.Violations {
+			fmt.Printf("  [rule %d] %s\n", v.Rule, v.Message)
+		}
+		os.Exit(1)
+	}
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: chaos <scenario> [flags]
 
 scenarios:
   leader-crash   start a cluster, sustained writes, repeatedly kill -9 the leader
   partition      split into a majority/minority, prove the minority can't write, heal, verify
+  concurrent     several concurrent writers, repeated failovers mid-run, verify no loss/corruption
 
 flags:
   -nodes N          cluster size (default 5)
   -rounds N         (leader-crash only) number of kill/recover rounds (default 5)
+  -writers N        (concurrent only) number of concurrent writer goroutines (default 5)
+  -kills N          (concurrent only) number of leader kills during the run (default 3)
   -base-dir dir     node data directory (default: fresh temp dir)
   -quorumd-bin path path to a built quorumd binary (default ./bin/quorumd)`)
 }
