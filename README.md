@@ -41,6 +41,53 @@ For a real multi-node cluster, each `quorumd` needs a `-peer id=raftAddr=clientA
 
 `quorumctl` follows `LeaderHint` redirects automatically and rotates through the address list on a network error or "no leader" mid-election — give it every node's address, not just one, or it has nowhere to fail over to.
 
+### Watching a real election happen
+
+Start the three `quorumd` commands above in three separate terminals (`n1`, `n2`, `n3`) and watch their logs. Within the default 150–300ms randomized timeout, exactly one of them wins — here's what's actually happening across the three terminals when that occurs (which node wins is random each run; this example shows `n2` winning):
+
+```mermaid
+sequenceDiagram
+    participant n1
+    participant n2
+    participant n3
+    Note over n1,n3: all three start as Follower, term 0
+    Note over n2: n2's randomized election timer fires first
+    n2->>n2: role=Candidate, term=1, votedFor=n2
+    n2->>n1: RequestVote(term=1, candidateId=n2)
+    n2->>n3: RequestVote(term=1, candidateId=n2)
+    n1-->>n2: VoteGranted=true
+    n3-->>n2: VoteGranted=true
+    Note over n2: 3 of 3 votes (self + n1 + n3) ≥ majority
+    n2->>n2: role=Leader, term=1
+    loop every 50ms
+        n2->>n1: AppendEntries (heartbeat)
+        n2->>n3: AppendEntries (heartbeat)
+    end
+```
+
+In the terminal logs, this shows up as `n2` printing `role=Candidate term=1` immediately followed by `role=Leader term=1`, while `n1` and `n3` stay quiet as followers (their own timers got reset by granting `n2`'s vote request). `quorumctl` run against any of the three addresses will always end up talking to `n2`.
+
+To watch a **real failover**: `Ctrl+C` (or `kill -9`) whichever terminal is currently the leader.
+
+```mermaid
+sequenceDiagram
+    participant n1
+    participant n2 as n2 (killed)
+    participant n3
+    Note over n2: n2 killed -- stops sending heartbeats
+    Note over n1,n3: no heartbeat for 150-300ms -> election timers fire
+    n3->>n3: role=Candidate, term=2, votedFor=n3
+    n3->>n1: RequestVote(term=2, candidateId=n3)
+    n1-->>n3: VoteGranted=true
+    Note over n3: 2 of 3 votes ≥ majority (n2 unreachable, doesn't matter)
+    n3->>n3: role=Leader, term=2
+    loop every 50ms
+        n3->>n1: AppendEntries (heartbeat)
+    end
+```
+
+The remaining two terminals will print a new `role=Candidate` → `role=Leader` transition at a higher term within roughly 150–300ms, and any `quorumctl` command run afterward against any of the three addresses (including the dead one, which just fails to dial) will still succeed — it follows the new leader automatically.
+
 ## Architecture
 
 ### Wire protocol: length-prefixed JSON over TCP
@@ -103,6 +150,26 @@ One deliberate deviation from the earliest design sketch: peer replication is **
 
 - A non-leader node responds `not leader` with a `LeaderHint` when it knows who the leader is, or `no leader` if an election is in progress — a client never hangs waiting.
 - Every write carries `ClientID` + `SeqNum` (Raft paper §8). If a client's write reaches a leader that loses leadership before the entry commits, the correct behavior is retry — and if the retry causes the same command to reach the log twice, `kvstore.Store.Apply` deduplicates by `(ClientID, SeqNum)` so it applies at most once. `internal/client` implements the redirect-and-retry logic once, shared by `quorumctl` and the chaos harness's workload goroutines, so both exercise identical real client behavior rather than a parallel reimplementation that could drift.
+
+A `Set` that happens to land on a follower first (the common case — a client doesn't know in advance who the leader is) redirects transparently, then replicates and commits before the client sees `OK`:
+
+```mermaid
+sequenceDiagram
+    participant Client as quorumctl
+    participant n1 as n1 (Follower)
+    participant n2 as n2 (Leader)
+    participant n3 as n3 (Follower)
+    Client->>n1: Set(foo, bar)
+    n1-->>Client: not leader, LeaderHint=n2
+    Client->>n2: Set(foo, bar)
+    n2->>n2: Propose() -> append to own log
+    n2->>n1: AppendEntries(entry)
+    n2->>n3: AppendEntries(entry)
+    n1-->>n2: Success
+    n3-->>n2: Success
+    Note over n2: majority replicated -> commitIndex advances -> Applier applies to KV
+    n2-->>Client: OK
+```
 
 ### KV state machine + Applier
 
