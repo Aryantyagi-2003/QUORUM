@@ -1,8 +1,9 @@
-.PHONY: build test test-race vet lint cluster chaos client clean
+.PHONY: build test test-race vet lint chaos client clean
 
 build:
 	go build -o bin/quorumd ./cmd/quorumd
 	go build -o bin/quorumctl ./cmd/quorumctl
+	go build -o bin/chaos ./cmd/chaos
 
 test:
 	go test ./...
@@ -16,15 +17,13 @@ vet:
 lint:
 	golangci-lint run ./...
 
-# Runs a local N-node cluster (N defaults to 5). Each node's data dir
-# and ports are under ./data/nodeN. Placeholder until multi-node wiring
-# (Phase 2+) lands; Phase 1 only supports a single node.
-cluster: build
-	./scripts/cluster.sh
-
-# Runs the chaos-testing harness (Phase 5).
+# Runs a chaos scenario against real quorumd processes. Pass the
+# scenario (and any flags) via ARGS, e.g.:
+#   make chaos ARGS="leader-crash"
+#   make chaos ARGS="sustained -duration 5m"
+# See `./bin/chaos` with no args for the full scenario/flag list.
 chaos: build
-	go run ./cmd/chaos
+	./bin/chaos $(ARGS)
 
 client: build
 	./bin/quorumctl $(ARGS)
